@@ -1,11 +1,26 @@
 import { useState, useEffect } from "react";
-import { useSearchParams } from "react-router-dom";
+import { useSearchParams, useParams } from "react-router-dom";
 import CodeGraphViewer from "../components/CodeGraphViewer";
 import LocalUploader from "../components/LocalUploader";
 import { motion, AnimatePresence } from "framer-motion";
 import { Loader2 } from "lucide-react";
 import { toast } from "sonner";
 import JSZip from "jszip";
+import { parseFilesIntoGraph } from "../lib/parser";
+import { parseFilesWithPyodide } from "../lib/parser-pyodide";
+
+const IGNORED_DIRS = new Set([
+  'node_modules', '.git', '.github', 'dist', 'build', 'out', 'coverage', 
+  '.next', '.nuxt', '__pycache__', 'venv', '.venv', 'env', '.env', '.tox',
+  'eggs', 'target', '.gradle', '.idea', 'cmake-build-debug', 'bin', 'obj',
+  'packages', 'vendor', 'Pods', '.build', 'DerivedData', '.dart_tool',
+  '.vscode'
+]);
+
+const isPathIgnored = (path: string) => {
+  const parts = path.split(/[\/\\]/);
+  return parts.some(part => IGNORED_DIRS.has(part));
+};
 
 const sanitizePath = (pathStr: string, repoName?: string): string => {
   if (!pathStr) return '';
@@ -40,9 +55,12 @@ const sanitizePath = (pathStr: string, repoName?: string): string => {
 
 const Explore = () => {
   const [searchParams] = useSearchParams();
+  const { owner, repo } = useParams();
   const [graphData, setGraphData] = useState<any>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [progressText, setProgressText] = useState("");
+  const [progressValue, setProgressValue] = useState(0);
 
   // Connection parameters for "Playground" mode (CLI/Database)
   const backend = searchParams.get("backend") || "";
@@ -65,6 +83,98 @@ const Explore = () => {
     }
     return url;
   };
+
+  // If owner and repo path parameters are present, auto-fetch and index the codebase!
+  useEffect(() => {
+    if (!owner || !repo) return;
+    
+    // Ignore static routes like "explore" getting caught as owner/repo
+    if (owner.toLowerCase() === "explore") return;
+
+    const autoFetchAndIndex = async () => {
+      setLoading(true);
+      setError(null);
+      setProgressText("Downloading repository zip archive...");
+      setProgressValue(10);
+      try {
+        // Fetch public repository ZIP via dynamic CORS-friendly proxy
+        let zipUrl = getCorsFriendlyUrl(`https://github.com/${owner}/${repo}/archive/refs/heads/main.zip`);
+        let response = await fetch(zipUrl);
+        
+        if (!response.ok) {
+          // Fallback to master branch
+          zipUrl = getCorsFriendlyUrl(`https://github.com/${owner}/${repo}/archive/refs/heads/master.zip`);
+          response = await fetch(zipUrl);
+        }
+
+        if (!response.ok) {
+          throw new Error(`Failed to fetch repository zip file (verify it is public and exists).`);
+        }
+
+        setProgressText("Unzipping archive in-memory...");
+        setProgressValue(30);
+        const buffer = await response.arrayBuffer();
+        const jszip = await JSZip.loadAsync(buffer);
+        
+        const files: any[] = [];
+        const promises: Promise<void>[] = [];
+        
+        jszip.forEach((path, entry) => {
+          if (
+            !entry.dir && 
+            path.match(/\.(js|ts|jsx|tsx|py|c|h|cpp|hpp|cc|cs|go|rs|rb|php|swift|kt|kts|dart)$/) && 
+            !isPathIgnored(path)
+          ) {
+            promises.push(
+              entry.async("text").then((content) => {
+                const cleanPath = path.substring(path.indexOf("/") + 1);
+                files.push({ path: cleanPath, content });
+              })
+            );
+          }
+        });
+        
+        if (promises.length === 0) {
+          throw new Error("No parseable code files found in the repository.");
+        }
+        
+        setProgressText(`Extracting ${promises.length} files...`);
+        setProgressValue(45);
+        await Promise.all(promises);
+
+        const fileContents: Record<string, string> = {};
+        for (const f of files) {
+          fileContents[f.path] = f.content;
+        }
+
+        setProgressText("Initializing Python semantic engine...");
+        setProgressValue(60);
+        
+        const graphData = await parseFilesWithPyodide(
+          files,
+          (msg, val) => {
+            setProgressText(msg);
+            setProgressValue(val);
+          },
+          { indexVariables: true }
+        );
+        
+        setProgressText("Complete!");
+        setProgressValue(100);
+        await new Promise((r) => setTimeout(r, 450));
+        
+        setGraphData({ ...graphData, fileContents });
+      } catch (err: any) {
+        console.error("Auto-Index Error:", err);
+        setError(err.message);
+        toast.error("Auto-Indexing failed: " + err.message);
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    autoFetchAndIndex();
+  }, [owner, repo]);
   
   // If bundleUrl is present, we download and parse it client-side
   useEffect(() => {
@@ -229,12 +339,26 @@ const Explore = () => {
   }, [backend, repoPath, cypherQuery]);
 
   if (loading) {
+    const isAutoIndexing = owner && repo && owner.toLowerCase() !== "explore";
     return (
-      <div className="min-h-screen flex flex-col items-center justify-center bg-background text-center px-6">
-        <Loader2 className="w-12 h-12 animate-spin text-primary mb-4" />
-        <p className="text-lg font-medium animate-pulse text-muted-foreground">
-          {bundleUrl ? "Downloading and parsing pre-indexed CGC bundle..." : "Connecting to local database..."}
+      <div className="min-h-screen flex flex-col items-center justify-center bg-background text-center px-6 max-w-md mx-auto">
+        <Loader2 className="w-14 h-14 animate-spin text-purple-500 mb-6 drop-shadow-[0_0_15px_rgba(168,85,247,0.4)]" />
+        <p className="text-lg font-medium text-white mb-4 animate-pulse">
+          {isAutoIndexing 
+            ? progressText 
+            : (bundleUrl ? "Downloading and parsing pre-indexed CGC bundle..." : "Connecting to local database...")}
         </p>
+        {isAutoIndexing && (
+          <div className="w-full bg-gray-800 rounded-full h-2 mt-2 overflow-hidden shadow-inner border border-white/5">
+            <div 
+              className="bg-gradient-to-r from-purple-400 to-indigo-400 h-2 rounded-full transition-all duration-300 ease-out" 
+              style={{ width: `${progressValue}%`, boxShadow: '0 0 15px rgba(168, 85, 247, 0.8)' }}
+            />
+          </div>
+        )}
+        {isAutoIndexing && (
+          <p className="text-xs text-gray-400 font-mono mt-3">{progressValue}%</p>
+        )}
       </div>
     );
   }
