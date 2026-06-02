@@ -132,18 +132,18 @@ def test_database_parity_e2e(temp_test_dir):
 
 async def _run_database_parity_e2e(temp_test_dir):
     """
-    Run indexing against KuzuDB, LadybugDB, FalkorDB Lite, and Neo4j
+    Run indexing against LadybugDB, FalkorDB Lite, and Neo4j
     and verify 100% mathematical parity across all extracted nodes and relationships.
     """
     os.environ.setdefault('NEO4J_URI', 'bolt://localhost:7687')
     os.environ.setdefault('NEO4J_USERNAME', 'neo4j')
     os.environ.setdefault('NEO4J_PASSWORD', '12345678')
-    
+
     project_path = Path("tests/fixtures/sample_projects").resolve()
-    
-    db_types = ["kuzudb", "ladybugdb", "falkordb", "neo4j"]
+
+    db_types = ["ladybugdb", "falkordb", "neo4j"]
     results = {}
-    
+
     for db_type in db_types:
         try:
             duration, stats = await run_indexing_in_process(db_type, project_path, temp_test_dir)
@@ -155,36 +155,37 @@ async def _run_database_parity_e2e(temp_test_dir):
             if db_type == "neo4j" and "failed to connect" in str(e).lower():
                 pytest.skip("Neo4j server is not running/available.")
             raise e
-            
+
     # Compile comparison and assert parity
     print("\n================= E2E PARITY TEST REPORT =================")
-    print(f"{'Metric':<25} | {'KuzuDB':<8} | {'LadybugDB':<9} | {'FalkorDB':<8} | {'Neo4j':<8} | Match?")
-    print("-" * 78)
-    
+    print(f"{'Metric':<25} | {'LadybugDB':<9} | {'FalkorDB':<8} | {'Neo4j':<8} | Match?")
+    print("-" * 68)
+
     keys_to_compare = sorted(list(results["neo4j"]["stats"].keys()))
     # Some relationship resolvers dedupe differently across embedded backends.
-    # REL_CALLS: KuzuDB/LadybugDB may drop ≤1 edge when the Neo4j fast/slow MATCH
-    # split cannot bind an exact called_line_number (binder/UNWIND fallback).
+    # REL_CALLS can vary by <=1 edge when the Neo4j fast/slow MATCH split
+    # cannot bind an exact called_line_number (binder/UNWIND fallback).
     allowed_spread = {"REL_IMPORTS": 6, "REL_CALLS": 1}
     all_match = True
-    
+
     for key in keys_to_compare:
-        kuzu_val = results["kuzudb"]["stats"].get(key, 0)
         ladybug_val = results["ladybugdb"]["stats"].get(key, 0)
         falkor_val = results["falkordb"]["stats"].get(key, 0)
         neo4j_val = results["neo4j"]["stats"].get(key, 0)
-        
-        spread = max(kuzu_val, ladybug_val, falkor_val, neo4j_val) - min(
-            kuzu_val, ladybug_val, falkor_val, neo4j_val
+
+        spread = max(ladybug_val, falkor_val, neo4j_val) - min(
+            ladybug_val,
+            falkor_val,
+            neo4j_val,
         )
         matches = spread <= allowed_spread.get(key, 0)
         match_str = "YES" if matches else "NO"
         if not matches:
             all_match = False
-            
-        print(f"{key:<25} | {kuzu_val:<8} | {ladybug_val:<9} | {falkor_val:<8} | {neo4j_val:<8} | {match_str}")
-        
-    print("-" * 78)
-    print(f"{'Indexing Duration (s)':<25} | {results['kuzudb']['duration']:<8.2f} | {results['ladybugdb']['duration']:<9.2f} | {results['falkordb']['duration']:<8.2f} | {results['neo4j']['duration']:<8.2f} | -")
-    
+
+        print(f"{key:<25} | {ladybug_val:<9} | {falkor_val:<8} | {neo4j_val:<8} | {match_str}")
+
+    print("-" * 68)
+    print(f"{'Indexing Duration (s)':<25} | {results['ladybugdb']['duration']:<9.2f} | {results['falkordb']['duration']:<8.2f} | {results['neo4j']['duration']:<8.2f} | -")
+
     assert all_match, "❌ Database statistics do not match!"

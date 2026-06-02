@@ -912,7 +912,7 @@ cgc import <bundle-file>.cgc
                 for line in f:
                     node_data = json.loads(line)
                     
-                    # Extract labels and old ID (handle both Neo4j and KuzuDB formats)
+                    # Extract labels and old ID (handle both Neo4j and embedded DB formats)
                     labels = node_data.pop('_labels', None) or node_data.pop('_label', None) or []
                     if isinstance(labels, str):
                         labels = [labels]

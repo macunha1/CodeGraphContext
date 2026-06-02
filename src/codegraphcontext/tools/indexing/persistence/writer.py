@@ -469,6 +469,9 @@ class GraphWriter:
                         raise e
 
             if class_fn_batch:
+
+                # LadybugDB requires deterministic node labels for relationship creation.
+                # We split the multi-label MATCH into individual queries.
                 for label in ("Class", "Module", "Interface", "Struct", "Record", "Trait", "Object", "Mixin"):
                     try:
                         session.run(
@@ -694,6 +697,8 @@ class GraphWriter:
         fn_to_param = fn_to_param or []
         fn_to_file = fn_to_file or []
 
+        # LadybugDB requires deterministic node labels for relationship creation.
+        # We use specific queries for each bucket to satisfy the binder.
         queries = [
             (fn_to_fn, "Function", "Function"),
             (fn_to_class, "Function", "Class"),
@@ -711,6 +716,7 @@ class GraphWriter:
                 if not batch_data:
                     continue
 
+                # Ensure all rows have the required keys with correct types for LadybugDB
                 sanitized_batch = []
                 for row in batch_data:
                     if not isinstance(row, dict) or not row.get("caller_file_path") or not row.get("called_name"):
@@ -729,6 +735,8 @@ class GraphWriter:
 
                     val = row.get("called_line_number")
                     if "called_line_number" not in row or not isinstance(val, int):
+
+                        # Force int for LadybugDB matching, handle None/0 (#885)
                         try:
                             row["called_line_number"] = int(val or 0)
                         except (ValueError, TypeError):
@@ -802,6 +810,8 @@ class GraphWriter:
                             session.run(q, batch=sub_batch)
                     except Exception as e:
                         if _is_binder_exception(e):
+
+                            # Skip unsupported label combinations in LadybugDB.
                             return
                         raise e
 
@@ -992,6 +1002,8 @@ class GraphWriter:
             internal_batch = [r for r in inheritance_batch if r.get("resolved_parent_file_path") != "__external__"]
             external_batch = [r for r in inheritance_batch if r.get("resolved_parent_file_path") == "__external__"]
 
+            # Internal inheritance (within workspace). LadybugDB binder needs
+            # explicit labels on both sides of relationship creation.
             labels = ("Class", "Trait", "Interface", "Struct", "Enum", "Union", "Record", "Mixin", "Extension", "Module", "Object", "Variable")
             for child_label in labels:
                 child_cypher = _cypher_label(child_label, backend)

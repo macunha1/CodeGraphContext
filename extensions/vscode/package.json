@@ -152,8 +152,8 @@
           "default": "falkordb",
           "enum": [
             "neo4j",
-            "kuzudb",
-            "falkordb"
+            "falkordb",
+            "ladybugdb"
           ],
           "description": "Target database mode for CGC runtime."
         },

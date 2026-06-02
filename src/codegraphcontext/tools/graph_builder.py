@@ -299,7 +299,7 @@ class GraphBuilder:
                                 'inner_line': item['line_number'],
                             })
 
-                # Normalize batch: KuzuDB requires uniform struct keys AND
+                # Normalize batch: LadybugDB requires uniform struct keys AND
                 # consistent types across all UNWIND items.  After
                 # _sanitize_props some items may have STRING[] while others
                 # have STRING (JSON-serialised) or None for the same key.
@@ -351,13 +351,13 @@ class GraphBuilder:
                                 elif not isinstance(v, str):
                                     b[k] = str(v)
 
-                    # Ensure consistent key order (KuzuDB structs are order-sensitive)
+                    # Ensure consistent key order (LadybugDB structs are order-sensitive)
                     key_order = sorted(all_keys)
                     batch[:] = [{k: b[k] for k in key_order} for b in batch]
 
                 # One UNWIND per label — replaces N individual session.run() calls.
                 # Split into node creation + relationship linking to avoid
-                # KuzuDB "Casting between NODE and NODE" errors when MERGE
+                # LadybugDB "Casting between NODE and NODE" errors when MERGE
                 # on a relationship follows MERGE on a node in the same query.
                 session.run(f"""
                     UNWIND $batch AS row

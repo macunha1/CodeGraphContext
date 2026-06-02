@@ -84,9 +84,9 @@ async def get_graph(repo_path: Optional[str] = None, cypher_query: Optional[str]
         if isinstance(element, (int, str)):
             return str(element)
         
-        # If element is a dict (like Neo4j returned items or KuzuDB node/rel dicts)
+        # If element is a dict (like Neo4j or embedded DB returned node/rel dicts)
         if isinstance(element, dict):
-            # KuzuDB _src / _dst are directly {'offset': X, 'table': Y}
+            # Embedded DB _src / _dst are directly {'offset': X, 'table': Y}
             if 'offset' in element and 'table' in element:
                 return f"{element.get('table')}_{element.get('offset')}"
                 
@@ -94,7 +94,7 @@ async def get_graph(repo_path: Optional[str] = None, cypher_query: Optional[str]
                 if key in element:
                     val = element[key]
                     if val is not None:
-                        # KuzuDB returns dict IDs like {'offset': 1, 'table': 0} inside nodes
+                        # Embedded DBs return dict IDs like {'offset': 1, 'table': 0} inside nodes
                         if isinstance(val, dict):
                             return f"{val.get('table', 0)}_{val.get('offset', 0)}"
                         return str(val)
@@ -105,7 +105,7 @@ async def get_graph(repo_path: Optional[str] = None, cypher_query: Optional[str]
             if hasattr(element, attr):
                 val = getattr(element, attr)
                 if val is not None: 
-                    # KuzuDB objects if any
+                    # Embedded DB objects if any
                     if isinstance(val, dict):
                         return f"{val.get('table', 0)}_{val.get('offset', 0)}"
                     return str(val)
@@ -163,7 +163,7 @@ async def get_graph(repo_path: Optional[str] = None, cypher_query: Optional[str]
                                 # Extract labels
                                 labels = []
                                 if isinstance(node, dict):
-                                    # KuzuDB node label is under '_label'
+                                    # LadybugDB node label is under '_label'
                                     if '_label' in node:
                                         labels = [node['_label']]
                                     elif 'label' in node:
@@ -221,10 +221,10 @@ async def get_graph(repo_path: Optional[str] = None, cypher_query: Optional[str]
                             else:
                                 print(f"DEBUG rel (obj): type={type(rel).__name__}, attrs={[a for a in dir(rel) if not a.startswith('__')]}", file=sys.stderr, flush=True)
 
-                        # FalkorDB / KuzuDB may return rels as dicts OR objects
+                        # FalkorDB / LadybugDB may return rels as dicts OR objects
                         if isinstance(rel, dict):
                             rid = get_eid(rel)
-                            # KuzuDB uses _src and _dst, FalkorDB uses src_node/dest_node
+                            # LadybugDB uses _src and _dst, FalkorDB uses src_node/dest_node
                             src = rel.get('_src', rel.get('src_node'))
                             dst = rel.get('_dst', rel.get('dest_node'))
                             
