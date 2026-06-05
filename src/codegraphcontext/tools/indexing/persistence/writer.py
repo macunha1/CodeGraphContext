@@ -519,13 +519,13 @@ class GraphWriter:
             for batch_data, caller_label, called_label in queries:
                 if not batch_data:
                     continue
-                
+
                 # Ensure all rows have the required keys with correct types for KuzuDB
                 sanitized_batch = []
                 for row in batch_data:
                     if not isinstance(row, dict) or not row.get("caller_file_path") or not row.get("called_name"):
                         continue
-                    
+
                     # Skip rows with explicitly False filters (considered malformed in #885)
                     if row.get("called_line_number") is False or row.get("called_context") is False:
                         continue
@@ -537,7 +537,7 @@ class GraphWriter:
                         row["resolution_tier"] = -1
                     if "confidence_label" not in row or row["confidence_label"] is None:
                         row["confidence_label"] = "EXTRACTED"
-                    
+
                     val = row.get("called_line_number")
                     if "called_line_number" not in row or not isinstance(val, int):
                         # Force int for KuzuDB matching, handle None/0 (#885)
@@ -545,12 +545,12 @@ class GraphWriter:
                             row["called_line_number"] = int(val or 0)
                         except (ValueError, TypeError):
                             row["called_line_number"] = 0
-                    
+
                     if "called_context" not in row or row["called_context"] is None:
                         row["called_context"] = ""
                     if "line_number" not in row or row["line_number"] is None:
                         row["line_number"] = 0
-                    
+
                     # Serialize args to a deterministic string for the MERGE key.
                     # FalkorDB can't match list-typed properties in MERGE (creates
                     # duplicates), but removing args entirely caused Neo4j to
@@ -562,7 +562,7 @@ class GraphWriter:
                         row["args_key"] = _json.dumps(raw_args, sort_keys=False)
                     else:
                         row["args_key"] = str(raw_args)
-                    
+
                     sanitized_batch.append(row)
 
                 if not sanitized_batch:
@@ -871,7 +871,7 @@ class GraphWriter:
         """
         _cpp_exts = ('.cpp', '.cc', '.cxx', '.c++', '.C')
         ext_conditions = ' OR '.join(f'fn.path ENDS WITH "{ext}"' for ext in _cpp_exts)
-        
+
         container_labels = ("Class", "Struct", "Module")
         with self.driver.session() as session:
             for clab in container_labels:
@@ -1349,8 +1349,23 @@ class GraphWriter:
                 break
             info_logger(f"[DELETE] Removed {deleted} CONTAINS rels for {repo_path_str}")
 
-        for label in ("Function", "Class", "Interface", "Trait", "Struct", "Enum", "Variable", "Macro", "Union", "Record", "Property", "File", "Module", "Mixin", "Extension", "Object", "Parameter", "Directory", "Repository", "ExternalClass", "DbTable"):
+        # Discover the labels currently in use rather than hardcoding the
+        # list. Every time the indexer learned a new node type (Variable,
+        # Parameter, Directory, ExternalClass, DbTable, ...) the hardcoded
+        # tuple here had to be kept in lockstep, and every miss leaked
+        # orphan nodes on `delete_repository`. `CALL db.labels()` returns
+        # exactly the set of labels that have at least one node in the
+        # current database -- per-label DETACH DELETE with the same path
+        # prefix is then label-agnostic and self-maintaining.
+        #
+        # Labels with no node matching the path prefix are cheap: the
+        # label-scoped scan returns 0 rows, the while-True loop exits
+        # immediately, and we move on.
+        with self.driver.session() as session:
+            label_records = session.run("CALL db.labels() YIELD label RETURN label")
+            all_labels = sorted({record["label"] for record in label_records})
 
+        for label in all_labels:
             while True:
                 with self.driver.session() as session:
                     result = session.run(

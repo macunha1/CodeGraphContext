@@ -28,7 +28,7 @@ Supported SCIP indexers and their install commands:
   rust       → cargo install scip-rust (or rustup component add rust-analyzer)
   java       → https://github.com/sourcegraph/scip-java
   c / c++    → scip-clang (JSON compilation database: compile_commands.json)
-  csharp     → scip-dotnet (dotnet tool install -g Microsoft.CodeAnalysis.ScipDotnet)
+  csharp     → scip-dotnet (dotnet tool install --global scip-dotnet)
 
 JavaScript indexing notes:
   - Pure JS projects (no tsconfig.json): scip-typescript index --infer-tsconfig
@@ -44,6 +44,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from ..utils.debug_log import error_logger, info_logger, warning_logger
+from ..utils.path_ignore import file_path_has_ignore_dir_segment
 
 # ---------------------------------------------------------------------------
 # SCIP indexer orchestration
@@ -67,9 +68,10 @@ EXTENSION_TO_SCIP: Dict[str, Tuple[str, str, str, str]] = {
     ".dart":  ("dart",       "scip_dart",       "dart pub global activate scip_dart", "dart:stable"),
     ".cpp":   ("cpp",        "scip-clang",      "brew install llvm", "sourcegraph/scip-clang:sha-1704d3d"),
     ".hpp":   ("cpp",        "scip-clang",      "brew install llvm", "sourcegraph/scip-clang:sha-1704d3d"),
+    ".hh":    ("cpp",        "scip-clang",      "brew install llvm", "sourcegraph/scip-clang:sha-1704d3d"),
     ".c":     ("c",          "scip-clang",      "brew install llvm", "sourcegraph/scip-clang:sha-1704d3d"),
     ".h":     ("cpp",        "scip-clang",      "brew install llvm", "sourcegraph/scip-clang:sha-1704d3d"),
-    ".cs":    ("csharp",     "scip-dotnet",     "dotnet tool install -g Microsoft.CodeAnalysis.ScipDotnet", "sourcegraph/scip-dotnet"),
+    ".cs":    ("csharp",     "scip-dotnet",     "dotnet tool install --global scip-dotnet", "sourcegraph/scip-dotnet"),
     ".php":   ("php",        "scip-php",        "composer global require davidrjenni/scip-php", "davidrjenni/scip-php"),
     ".rb":    ("ruby",       "scip-ruby",       "gem install scip-ruby", ""),
     ".swift": ("swift",      "scip-swift",      "brew install scip-swift", ""),
@@ -117,17 +119,6 @@ def detect_project_lang(path: Path, scip_languages: List[str]) -> Optional[str]:
 
     # Return the most frequent language
     return max(counts, key=counts.get)
-
-
-def file_path_has_ignore_dir_segment(path: Path, root: Path) -> bool:
-    """True if the path contains common ignored directory segments (node_modules, etc)."""
-    try:
-        rel = path.relative_to(root)
-        parts = rel.parts
-        ignore = {"node_modules", "vendor", ".git", "target", "build", "dist", "bin", "obj"}
-        return any(p in ignore for p in parts)
-    except ValueError:
-        return False
 
 
 class ScipIndexer:

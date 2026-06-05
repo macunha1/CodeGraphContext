@@ -2,14 +2,16 @@
 
 # src/codegraphcontext/tools/graph_builder.py
 """Facade for graph indexing; implementation lives in indexing/."""
+from __future__ import annotations
 
 import asyncio
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, TYPE_CHECKING
 
 from ..cli.config_manager import get_config_value
-from ..core.database import DatabaseManager
+if TYPE_CHECKING:
+    from ..core.database import DatabaseManager
 from ..core.jobs import JobManager, JobStatus
 from ..utils.debug_log import debug_log, error_logger, info_logger, warning_logger
 from .indexing.constants import DEFAULT_IGNORE_PATTERNS
@@ -43,6 +45,8 @@ class GraphBuilder:
             ".cjs": "javascript",
             ".go": "go",
             ".ts": "typescript",
+            ".mts": "typescript",
+            ".cts": "typescript",
             ".d.ts": "typescript",
             ".tsx": "tsx",
             ".cpp": "cpp",
@@ -66,6 +70,7 @@ class GraphBuilder:
             ".lua": "lua",
             ".ex": "elixir",
             ".exs": "elixir",
+            ".el": "elisp",
             ".html": "html",
             ".css": "css",
         }
