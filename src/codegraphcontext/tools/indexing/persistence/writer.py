@@ -11,6 +11,22 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from ....utils.debug_log import info_logger, warning_logger
 from ....utils.git_utils import get_repo_commit_hash
 from ..sanitize import sanitize_props
+from ..schema_contract import NODE_LABELS
+
+
+def _normalize_path(p) -> str:
+    """Normalize a path to use forward slashes for cross-platform DB consistency.
+
+    On Windows, Path.resolve() returns backslashes which breaks STARTS WITH
+    queries in the graph DB. Always store and query with forward slashes.
+    See: https://github.com/CodeGraphContext/CodeGraphContext/issues/1080
+    """
+    return Path(p).resolve().as_posix()
+
+
+def _normalize_prefix(p) -> str:
+    """Return a normalized path prefix ending with '/' for STARTS WITH queries."""
+    return _normalize_path(p) + "/"
 
 
 def _is_binder_exception(e: Exception) -> bool:
@@ -22,15 +38,91 @@ def _is_binder_exception(e: Exception) -> bool:
 class GraphWriter:
     """Persists repository/file/symbol nodes and relationships via the Neo4j-like driver API."""
 
-    def __init__(self, driver: Any):
+    def __init__(self, driver: Any, db_manager: Any = None):
         self.driver = driver
+        self._db_manager = db_manager
+        if db_manager is None:
+            warning_logger(
+                "[GraphWriter] db_manager not provided; "
+                "backend detection will default to 'neo4j'"
+            )
+
+    def _get_all_node_labels(self) -> list[str]:
+        """Discover all node labels in the database, backend-aware.
+
+        Neo4j / Nornic use ``CALL db.labels()``.
+        KuzuDB / LadybugDB use ``MATCH (n) RETURN DISTINCT label(n)``
+        (``SHOW TABLES`` is not supported in KuzuDB Python bindings ≤ 0.11).
+        FalkorDB uses ``CALL db.labels()`` without YIELD.
+        All backends fall back to :data:`schema_contract.NODE_LABELS`
+        plus supplementary labels on failure.
+        """
+        # Prefer db_manager.get_backend_type(); fall back to driver, then neo4j
+        backend = (
+            getattr(self._db_manager, "get_backend_type", None)
+            or getattr(self.driver, "get_backend_type", None)
+            or (lambda: "neo4j")
+        )()
+
+        if backend in ("kuzudb", "ladybugdb"):
+            # NOTE: Full node scan required because SHOW TABLES is unavailable
+            # in KuzuDB ≤ 0.11. Acceptable for delete_repository (low-frequency).
+            try:
+                with self.driver.session() as session:
+                    result = session.run(
+                        "MATCH (n) RETURN DISTINCT label(n) AS lbl"
+                    )
+                    labels = sorted(
+                        {record[0] for record in result if record[0] is not None}
+                    )
+                    if labels:
+                        return labels
+            except Exception as e:
+                info_logger(
+                    f"[DELETE] label discovery failed for {backend} "
+                    f"({e}), using fallback list"
+                )
+
+        elif backend in ("neo4j", "nornic"):
+            try:
+                with self.driver.session() as session:
+                    label_records = session.run(
+                        "CALL db.labels() YIELD label RETURN label"
+                    )
+                    return sorted({record["label"] for record in label_records})
+            except Exception as e:
+                info_logger(
+                    f"[DELETE] CALL db.labels() failed for {backend} "
+                    f"({e}), using fallback list"
+                )
+
+        elif backend in ("falkordb", "falkordb-remote"):
+            try:
+                with self.driver.session() as session:
+                    label_records = session.run("CALL db.labels()")
+                    return sorted({record["label"] for record in label_records})
+            except Exception as e:
+                info_logger(
+                    f"[DELETE] CALL db.labels() failed for {backend} "
+                    f"({e}), using fallback list"
+                )
+
+        # Fallback: canonical NODE_LABELS from schema_contract + supplementary
+        # labels that may exist in the graph from dynamic indexing paths.
+        return sorted(NODE_LABELS | {
+            "ExternalClass", "ExternalFunction",
+            "EnumValue", "Namespace", "TypeAlias", "Decorator",
+            "Method", "Endpoint", "OrmMapping", "Query",
+            "SpringDataRepository", "Mixin", "Extension", "Object",
+        })
 
     def add_repository_to_graph(self, repo_path: Path, is_dependency: bool = False) -> None:
         repo_name = repo_path.name
-        resolved = repo_path.resolve()
-        repo_path_str = str(resolved)
+        # Use _normalize_path so the stored path always uses forward slashes,
+        # making STARTS WITH queries work on Windows too.
+        repo_path_str = _normalize_path(repo_path)
 
-        commit_hash = get_repo_commit_hash(resolved)
+        commit_hash = get_repo_commit_hash(repo_path.resolve())
         indexed_at = datetime.now(timezone.utc).isoformat()
 
         with self.driver.session() as session:
@@ -46,8 +138,6 @@ class GraphWriter:
                 is_dependency=is_dependency,
                 indexed_at=indexed_at,
             )
-            # Write commit_hash only when the repo is a git working tree so that
-            # non-git directories do not get a null/empty property polluting the schema.
             if commit_hash:
                 session.run(
                     """
@@ -65,7 +155,8 @@ class GraphWriter:
         imports_map: dict,
         repo_path_str: Optional[str] = None,
     ) -> None:
-        file_path_str = str(Path(file_data["path"]).resolve())
+        # Normalize: always store with forward slashes
+        file_path_str = _normalize_path(file_data["path"])
         file_name = Path(file_path_str).name
         is_dependency = file_data.get("is_dependency", False)
         lang = file_data.get("lang")
@@ -76,10 +167,10 @@ class GraphWriter:
             else:
                 repo_result = session.run(
                     "MATCH (r:Repository {path: $repo_path}) RETURN r.path as path",
-                    repo_path=str(Path(file_data["repo_path"]).resolve()),
+                    repo_path=_normalize_path(file_data["repo_path"]),
                 ).single()
                 resolved_repo_str = (
-                    repo_result["path"] if repo_result else str(Path(file_data["repo_path"]).resolve())
+                    repo_result["path"] if repo_result else _normalize_path(file_data["repo_path"])
                 )
                 if not repo_result:
                     warning_logger(
@@ -108,7 +199,8 @@ class GraphWriter:
             parent_path = resolved_repo_str
             parent_label = "Repository"
             for part in relative_path_to_file.parts[:-1]:
-                current_path_str = str(Path(parent_path) / part)
+                # Normalize directory paths too
+                current_path_str = _normalize_path(Path(parent_path) / part)
                 session.run(
                     f"""
                     MATCH (p:`{parent_label}` {{path: $parent_path}})
@@ -272,10 +364,6 @@ class GraphWriter:
                 )
 
             if params_batch:
-                # Deduplicate parameter rows to ensure consistent counts across
-                # all database backends.  FalkorDB in particular may create
-                # duplicate Parameter nodes / HAS_PARAMETER edges when the same
-                # (func_name, line_number, arg_name) tuple appears more than once.
                 seen_params: set = set()
                 unique_params: List[Dict[str, Any]] = []
                 for p in params_batch:
@@ -288,6 +376,7 @@ class GraphWriter:
                     UNWIND $batch AS row
                     MATCH (fn:Function {name: row.func_name, path: $file_path, line_number: row.line_number})
                     MERGE (p:Parameter {name: row.arg_name, path: $file_path, function_line_number: row.line_number})
+                    SET p.name = row.arg_name, p.path = $file_path, p.function_line_number = row.line_number
                     MERGE (fn)-[:HAS_PARAMETER]->(p)
                 """,
                     batch=unique_params,
@@ -295,8 +384,6 @@ class GraphWriter:
                 )
 
             if class_fn_batch:
-                # KuzuDB requires deterministic node labels for relationship creation.
-                # We split the multi-label MATCH into individual queries.
                 for label in ("Class", "Module", "Interface", "Struct", "Record", "Trait", "Object", "Mixin"):
                     try:
                         session.run(
@@ -369,10 +456,9 @@ class GraphWriter:
                     UNWIND $batch AS row
                     MATCH (f:File {path: $file_path})
                     MERGE (m:Module {name: row.module_name})
-                    MERGE (f)-[r:IMPORTS]->(m)
+                    MERGE (f)-[r:IMPORTS {line_number: row.line_number}]->(m)
                     SET r.imported_name = row.imported_name,
-                        r.alias = row.alias,
-                        r.line_number = row.line_number
+                        r.alias = row.alias
                 """,
                     batch=js_imports,
                     file_path=file_path_str,
@@ -386,9 +472,8 @@ class GraphWriter:
                     MERGE (m:Module {name: row.name})
                     SET m.lang = coalesce(row.lang, m.lang),
                         m.full_import_name = coalesce(row.full_import_name, m.full_import_name)
-                    MERGE (f)-[r:IMPORTS]->(m)
-                    SET r.line_number = row.line_number,
-                        r.alias = coalesce(row.alias, ""),
+                    MERGE (f)-[r:IMPORTS {line_number: row.line_number}]->(m)
+                    SET r.alias = coalesce(row.alias, ""),
                         r.imported_name = row.imported_name,
                         r.full_import_name = row.full_import_name
                 """,
@@ -414,10 +499,11 @@ class GraphWriter:
     def add_minimal_file_node(
         self, file_path: Path, repo_path: Path, is_dependency: bool = False
     ) -> None:
-        file_path_str = str(file_path.resolve())
+        # Normalize both paths for cross-platform consistency
+        file_path_str = _normalize_path(file_path)
         file_name = file_path.name
         repo_name = repo_path.name
-        repo_path_str = str(repo_path.resolve())
+        repo_path_str = _normalize_path(repo_path)
 
         with self.driver.session() as session:
             session.run(
@@ -451,8 +537,8 @@ class GraphWriter:
             parent_label = "Repository"
 
             for part in relative_path_to_file.parts[:-1]:
-                current_path = Path(parent_path) / part
-                current_path_str = str(current_path)
+                # Normalize directory node paths too
+                current_path_str = _normalize_path(Path(parent_path) / part)
 
                 session.run(
                     f"""
@@ -492,7 +578,6 @@ class GraphWriter:
     ) -> None:
         batch_size = 1000
 
-        # Initialize defaults to avoid TypeError on missing args or None values
         fn_to_fn = fn_to_fn or []
         fn_to_class = fn_to_class or []
         fn_to_interface = fn_to_interface or []
@@ -502,8 +587,6 @@ class GraphWriter:
         file_to_interface = file_to_interface or []
         file_to_object = file_to_object or []
 
-        # KuzuDB requires deterministic node labels for relationship creation.
-        # We use specific queries for each bucket to satisfy the binder.
         queries = [
             (fn_to_fn, "Function", "Function"),
             (fn_to_class, "Function", "Class"),
@@ -520,17 +603,15 @@ class GraphWriter:
                 if not batch_data:
                     continue
 
-                # Ensure all rows have the required keys with correct types for KuzuDB
                 sanitized_batch = []
                 for row in batch_data:
                     if not isinstance(row, dict) or not row.get("caller_file_path") or not row.get("called_name"):
                         continue
 
-                    # Skip rows with explicitly False filters (considered malformed in #885)
                     if row.get("called_line_number") is False or row.get("called_context") is False:
                         continue
 
-                    row = dict(row) # Copy to avoid mutating input
+                    row = dict(row)
                     if "confidence" not in row or row["confidence"] is None:
                         row["confidence"] = 0.0
                     if "resolution_tier" not in row or row["resolution_tier"] is None:
@@ -540,7 +621,6 @@ class GraphWriter:
 
                     val = row.get("called_line_number")
                     if "called_line_number" not in row or not isinstance(val, int):
-                        # Force int for KuzuDB matching, handle None/0 (#885)
                         try:
                             row["called_line_number"] = int(val or 0)
                         except (ValueError, TypeError):
@@ -551,11 +631,6 @@ class GraphWriter:
                     if "line_number" not in row or row["line_number"] is None:
                         row["line_number"] = 0
 
-                    # Serialize args to a deterministic string for the MERGE key.
-                    # FalkorDB can't match list-typed properties in MERGE (creates
-                    # duplicates), but removing args entirely caused Neo4j to
-                    # merge distinct calls.  A serialized string gives universal
-                    # scalar comparison across all backends.
                     import json as _json
                     raw_args = row.get("args") or []
                     if isinstance(raw_args, list):
@@ -568,11 +643,6 @@ class GraphWriter:
                 if not sanitized_batch:
                     continue
 
-                # Deduplicate CALLS batch to ensure consistent counts across
-                # all backends.  FalkorDB's MERGE within an UNWIND batch does
-                # not see edges created by earlier rows in the same snapshot,
-                # leading to duplicate edges.  Dedup at the application level
-                # guarantees identical input to every backend.
                 seen_calls: set = set()
                 unique_calls: List[Dict[str, Any]] = []
                 for row in sanitized_batch:
@@ -593,13 +663,11 @@ class GraphWriter:
                         unique_calls.append(row)
                 sanitized_batch = unique_calls
 
-                # Define which labels have a 'context' property in the schema
                 labels_with_context = {"Function", "Variable"}
                 called_context_clause = ""
                 if called_label in labels_with_context:
                     called_context_clause = 'AND (row.called_context = "" OR called.context = row.called_context)'
 
-                # Choose query pattern based on whether caller is a File
                 if caller_label == "File":
                     q = f"""
                         UNWIND $batch AS row
@@ -634,7 +702,6 @@ class GraphWriter:
                         session.run(q, batch=batch)
                     except Exception as e:
                         if _is_binder_exception(e):
-                            # Skip unsupported label combinations in KuzuDB
                             continue
                         raise e
                 info_logger(f"[CALLS] {caller_label}-to-{called_label}: {len(sanitized_batch)} edges written in {time.time()-t0:.1f}s")
@@ -647,7 +714,7 @@ class GraphWriter:
         if file_data.get("lang") != "c_sharp":
             return
 
-        caller_file_path = str(Path(file_data["path"]).resolve())
+        caller_file_path = _normalize_path(file_data["path"])
 
         for type_list_name, type_label in [
             ("classes", "Class"),
@@ -678,7 +745,6 @@ class GraphWriter:
                     base_index = type_item["bases"].index(base_str)
 
                     if is_interface or (base_index > 0 and type_label == "Class"):
-                        # Split by label for Kuzu binder
                         for clab in ("Class", "Struct", "Record", "Mixin", "Extension"):
                             try:
                                 session.run(
@@ -731,9 +797,6 @@ class GraphWriter:
             internal_batch = [r for r in inheritance_batch if r.get("resolved_parent_file_path") != "__external__"]
             external_batch = [r for r in inheritance_batch if r.get("resolved_parent_file_path") == "__external__"]
 
-            # Internal inheritance (within workspace)
-            # KuzuDB binder requires explicit labels on both sides of a relationship creation.
-            # We iterate over labels to ensure each MERGE targets a single sub-table of the INHERITS group.
             labels = ("Class", "Trait", "Interface", "Struct", "Enum", "Union", "Record", "Mixin", "Extension", "Module", "Object")
             for child_label in labels:
                 for parent_label in labels:
@@ -753,7 +816,6 @@ class GraphWriter:
                             continue
                         raise e
 
-            # External inheritance (outside workspace)
             for child_label in labels:
                 try:
                     session.run(
@@ -782,7 +844,6 @@ class GraphWriter:
     ) -> None:
         with self.driver.session() as session:
             for file_data in files_data.values():
-                # ── Code-level caller → Any code-level callee ────────────────
                 caller_labels = ("Function", "Variable", "Class", "Interface", "Trait", "Struct", "Record", "Union", "Mixin", "Extension")
                 callee_labels = ("Function", "Class", "Interface", "Trait", "Struct", "Enum", "Record", "Union", "Mixin", "Extension")
                 for edge in file_data.get("function_calls_scip", []):
@@ -805,7 +866,6 @@ class GraphWriter:
                             except Exception as e:
                                 warning_logger(f"Failed to write SCIP call edge: {e}")
 
-                # ── Module-level (top-level) caller → Any code-level callee ─
                 for edge in file_data.get("module_level_calls_scip", []):
                     for calab in callee_labels:
                         try:
@@ -824,7 +884,7 @@ class GraphWriter:
                             warning_logger(f"Failed to write SCIP module-level call edge: {e}")
 
     def delete_file_from_graph(self, path: str) -> None:
-        file_path_str = str(Path(path).resolve())
+        file_path_str = _normalize_path(path)
         with self.driver.session() as session:
             parents_res = session.run(
                 """
@@ -855,8 +915,6 @@ class GraphWriter:
                     path=p,
                 )
 
-    # ── Spring semantic edges (#887) ───────────────────────────────────────────
-
     def write_cpp_class_function_links(self, repo_path_str: str) -> None:
         """Post-pass: create Class-[:CONTAINS]->Function edges for C++ files.
 
@@ -869,6 +927,9 @@ class GraphWriter:
         Scoped strictly to C++ extensions (.cpp / .cc / .cxx / .c++ / .C) so
         other languages are completely unaffected.
         """
+        # Normalize the incoming repo path so STARTS WITH matches stored paths
+        repo_path_str = _normalize_path(repo_path_str)
+
         _cpp_exts = ('.cpp', '.cc', '.cxx', '.c++', '.C')
         ext_conditions = ' OR '.join(f'fn.path ENDS WITH "{ext}"' for ext in _cpp_exts)
 
@@ -888,7 +949,7 @@ class GraphWriter:
                 try:
                     session.run(query, repo_path=repo_path_str)
                 except Exception as e:
-                    debug_log(f"Failed to link C++ methods for label {clab}: {e}")
+                    warning_logger(f"Failed to link C++ methods for label {clab}: {e}")
 
     def write_spring_inject_links(self, inject_batch: List[Dict[str, Any]]) -> None:
         """Create INJECTS edges: injector Class -> injected Class (via @Autowired / @Inject)."""
@@ -933,8 +994,6 @@ class GraphWriter:
                 )
         info_logger("[SPRING] Endpoint properties updated.")
 
-    # ── Maven / Gradle build graph (#888) ─────────────────────────────────────
-
     def write_maven_build_graph(self, build_data: Dict[str, Any], repo_path_str: str) -> None:
         """Write MavenModule nodes, CHILD_MODULE, MODULE_DEPENDS_ON, USES_LIBRARY edges."""
         if not build_data:
@@ -947,13 +1006,15 @@ class GraphWriter:
         if not modules:
             return
 
+        # Normalize repo path for consistent STARTS WITH matching
+        repo_path_str = _normalize_path(repo_path_str)
+
         info_logger(f"[MAVEN] Writing {len(modules)} modules, "
                     f"{len(inter_module_deps)} inter-module deps, "
                     f"{len(external_libs)} external libs...")
 
         batch_size = 200
         with self.driver.session() as session:
-            # MavenModule nodes
             for i in range(0, len(modules), batch_size):
                 session.run(
                     """
@@ -968,7 +1029,6 @@ class GraphWriter:
                     batch=modules[i : i + batch_size],
                     repo_path=repo_path_str,
                 )
-            # CHILD_MODULE edges
             for i in range(0, len(child_relations), batch_size):
                 session.run(
                     """
@@ -979,7 +1039,6 @@ class GraphWriter:
                     """,
                     batch=child_relations[i : i + batch_size],
                 )
-            # MODULE_DEPENDS_ON edges (inter-module)
             for i in range(0, len(inter_module_deps), batch_size):
                 session.run(
                     """
@@ -991,7 +1050,6 @@ class GraphWriter:
                     """,
                     batch=inter_module_deps[i : i + batch_size],
                 )
-            # ExternalLibrary nodes + USES_LIBRARY edges
             for i in range(0, len(external_libs), batch_size):
                 session.run(
                     """
@@ -1018,6 +1076,9 @@ class GraphWriter:
 
         if not modules:
             return
+
+        # Normalize repo path for consistent STARTS WITH matching
+        repo_path_str = _normalize_path(repo_path_str)
 
         info_logger(f"[GRADLE] Writing {len(modules)} modules, "
                     f"{len(inter_module_deps)} inter-module deps, "
@@ -1062,14 +1123,8 @@ class GraphWriter:
 
         info_logger("[GRADLE] Build graph written.")
 
-    # ── Datasource architecture graph (#843 scoped) ──────────────────────────
-
     def write_datasource_graph(self, ingested: Dict[str, Any]) -> None:
-        """Write Datasource / DbTable / DbColumn / RedisKeyPattern nodes and edges.
-
-        Accepts the dict returned by mysql_ingester.ingest(), cassandra_ingester.ingest(),
-        or redis_ingester.ingest().
-        """
+        """Write Datasource / DbTable / DbColumn / RedisKeyPattern nodes and edges."""
         ds = ingested.get("datasource", {})
         if not ds:
             return
@@ -1089,7 +1144,6 @@ class GraphWriter:
             )
         info_logger(f"[DATASOURCE] Written Datasource node: {ds_name} ({ds_kind})")
 
-        # ── MySQL / Cassandra tables + columns ────────────────────────────
         tables = ingested.get("tables", [])
         batch_size = 500
 
@@ -1132,7 +1186,6 @@ class GraphWriter:
         if columns:
             info_logger(f"[DATASOURCE] Written {len(columns)} DbColumn nodes for {ds_name}")
 
-        # ── Redis key patterns ────────────────────────────────────────────
         key_patterns = ingested.get("key_patterns", [])
         for i in range(0, len(key_patterns), batch_size):
             with self.driver.session() as session:
@@ -1153,12 +1206,7 @@ class GraphWriter:
             info_logger(f"[DATASOURCE] Written {len(key_patterns)} RedisKeyPattern nodes for {ds_name}")
 
     def write_orm_mappings(self, orm_batch: List[Dict[str, Any]]) -> None:
-        """Write MAPS_TO edges from Class → DbTable (JPA, Cassandra, Redis) for #843.
-
-        Each record in orm_batch must have:
-            kind: "class_table"
-            class_name, class_path, orm_table, datastore, line_number
-        """
+        """Write MAPS_TO edges from Class → DbTable (JPA, Cassandra, Redis)."""
         class_table = [r for r in orm_batch if r.get("kind") == "class_table"]
         if not class_table:
             return
@@ -1180,17 +1228,11 @@ class GraphWriter:
         info_logger(f"[ORM] Written {len(class_table)} MAPS_TO edges")
 
     def write_query_links(self, query_batch: List[Dict[str, Any]]) -> None:
-        """Write READS / WRITES edges from Function → DbTable for #843.
-
-        Each record must have:
-            kind: "method_query"
-            method_name, class_name, method_path, db_tables, operation, line_number
-        """
+        """Write READS / WRITES edges from Function → DbTable."""
         method_queries = [r for r in query_batch if r.get("kind") == "method_query" and r.get("db_tables")]
         if not method_queries:
             return
 
-        # Flatten: one edge per (method, table)
         edges = []
         for r in method_queries:
             for tbl in r["db_tables"]:
@@ -1222,14 +1264,7 @@ class GraphWriter:
         info_logger(f"[ORM] Written {len(edges)} READS/WRITES query edges")
 
     def write_mybatis_links(self, mybatis_batch: List[Dict[str, Any]]) -> None:
-        """Write READS / WRITES edges from Function → DbTable for MyBatis XML mappers.
-
-        Matches Function nodes by (name, class_context) instead of path because
-        the XML mapper files don't directly reference Java source paths.
-
-        Each record must have:
-            method_name, class_name, db_tables (list), operation ("READS"/"WRITES")
-        """
+        """Write READS / WRITES edges from Function → DbTable for MyBatis XML mappers."""
         edges = []
         for r in mybatis_batch:
             for tbl in r.get("db_tables", []):
@@ -1267,14 +1302,7 @@ class GraphWriter:
         info_logger(f"[MYBATIS] Written {written} READS/WRITES MyBatis edges")
 
     def write_spring_data_repo_links(self, orm_batch: List[Dict[str, Any]]) -> None:
-        """Write READS/WRITES edges for Spring Data repository derived-query methods.
-
-        Each record must have kind='spring_data_method' and:
-            entity_class, method_name, method_path, operation, line_number
-
-        Uses a two-hop lookup: Function → (entity_class Class)-[:MAPS_TO]→ DbTable
-        so no table name is required at parse time.
-        """
+        """Write READS/WRITES edges for Spring Data repository derived-query methods."""
         records = [r for r in orm_batch if r.get("kind") == "spring_data_method"]
         if not records:
             return
@@ -1311,14 +1339,20 @@ class GraphWriter:
         info_logger(f"[SPRING_DATA] Written {written} READS/WRITES derived-query edges")
 
     def delete_repository_from_graph(self, repo_path: str) -> bool:
-        repo_path_str = repo_path
-        path_prefix = repo_path_str + "/"
+        # Normalize to forward slashes — paths are always stored normalized.
+        # The old .replace("\\", "/") band-aid is replaced by _normalize_path
+        # which uses Path.resolve().as_posix() for consistent cross-platform output.
+        # See: https://github.com/CodeGraphContext/CodeGraphContext/issues/1080
+        repo_path_str = _normalize_path(repo_path)
+        path_prefix = _normalize_prefix(repo_path)
+
         with self.driver.session() as session:
             result = session.run(
-                "MATCH (r:Repository {path: $path}) RETURN count(r) as cnt", path=repo_path_str
+                "MATCH (r:Repository {path: $path}) RETURN count(r) as cnt",
+                path=repo_path_str,
             ).single()
             if not result or result["cnt"] == 0:
-                warning_logger(f"Attempted to delete non-existent repository: {repo_path_str}")
+                warning_logger(f"Attempted to delete non-existent repository: {repo_path}")
                 return False
 
         for rel_type in ("CALLS", "INHERITS", "IMPORTS"):
@@ -1326,9 +1360,11 @@ class GraphWriter:
                 with self.driver.session() as session:
                     result = session.run(
                         f"MATCH (a)-[r:{rel_type}]->(b) "
-                        "WHERE a.path STARTS WITH $prefix OR b.path STARTS WITH $prefix "
+                        "WHERE a.path STARTS WITH $prefix OR a.path = $path "
+                        "OR b.path STARTS WITH $prefix OR b.path = $path "
                         "WITH r LIMIT 5000 DELETE r RETURN count(r) AS deleted",
                         prefix=path_prefix,
+                        path=repo_path_str,
                     ).single()
                     deleted = result["deleted"] if result else 0
                 if deleted == 0:
@@ -1349,29 +1385,16 @@ class GraphWriter:
                 break
             info_logger(f"[DELETE] Removed {deleted} CONTAINS rels for {repo_path_str}")
 
-        # Discover the labels currently in use rather than hardcoding the
-        # list. Every time the indexer learned a new node type (Variable,
-        # Parameter, Directory, ExternalClass, DbTable, ...) the hardcoded
-        # tuple here had to be kept in lockstep, and every miss leaked
-        # orphan nodes on `delete_repository`. `CALL db.labels()` returns
-        # exactly the set of labels that have at least one node in the
-        # current database -- per-label DETACH DELETE with the same path
-        # prefix is then label-agnostic and self-maintaining.
-        #
-        # Labels with no node matching the path prefix are cheap: the
-        # label-scoped scan returns 0 rows, the while-True loop exits
-        # immediately, and we move on.
-        with self.driver.session() as session:
-            label_records = session.run("CALL db.labels() YIELD label RETURN label")
-            all_labels = sorted({record["label"] for record in label_records})
+        all_labels = self._get_all_node_labels()
 
         for label in all_labels:
             while True:
                 with self.driver.session() as session:
                     result = session.run(
-                        f"MATCH (n:{label}) WHERE n.path STARTS WITH $prefix "
+                        f"MATCH (n:{label}) WHERE n.path STARTS WITH $prefix OR n.path = $path "
                         "WITH n LIMIT 10000 DETACH DELETE n RETURN count(n) AS deleted",
                         prefix=path_prefix,
+                        path=repo_path_str,
                     ).single()
                     deleted = result["deleted"] if result else 0
                 if deleted == 0:
@@ -1424,7 +1447,8 @@ class GraphWriter:
         info_logger(f"[RELINK] Deleted {cnt} INHERITS for {len(file_paths)} affected files")
 
     def get_repo_class_lookup(self, repo_path: Path) -> Dict[str, set]:
-        prefix = str(repo_path.resolve()) + "/"
+        # Use _normalize_prefix so the STARTS WITH matches forward-slash stored paths
+        prefix = _normalize_prefix(repo_path)
         result_map: Dict[str, set] = {}
         with self.driver.session() as session:
             result = session.run(
@@ -1440,7 +1464,8 @@ class GraphWriter:
         return result_map
 
     def delete_relationship_links(self, repo_path: Path) -> None:
-        repo_path_str = str(repo_path.resolve()) + "/"
+        # Use _normalize_prefix so the STARTS WITH matches forward-slash stored paths
+        repo_path_str = _normalize_prefix(repo_path)
         with self.driver.session() as session:
             result = session.run(
                 "MATCH (a)-[r:CALLS]->(b) WHERE a.path STARTS WITH $prefix DELETE r RETURN count(r) AS cnt",
