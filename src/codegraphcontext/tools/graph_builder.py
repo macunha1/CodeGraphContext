@@ -765,6 +765,9 @@ class GraphBuilder:
     def get_caller_file_paths(self, file_path_str: str) -> set:
         return self._writer.get_caller_file_paths(file_path_str)
 
+    def get_repo_file_paths(self, repo_path: Path) -> set:
+        return self._writer.get_repo_file_paths(repo_path)
+
     def get_inheritance_neighbor_paths(self, file_path_str: str) -> set:
         return self._writer.get_inheritance_neighbor_paths(file_path_str)
 

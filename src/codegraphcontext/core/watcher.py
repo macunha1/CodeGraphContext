@@ -48,6 +48,7 @@ class RepositoryEventHandler(FileSystemEventHandler):
         perform_initial_scan: bool = True,
         cgcignore_path: str = None,
         ignore_spec: "PathSpec" = None,
+        sync_on_start: bool = False,
     ):
         """
         Initializes the event handler.
@@ -59,6 +60,7 @@ class RepositoryEventHandler(FileSystemEventHandler):
             perform_initial_scan: Whether to perform an initial scan of the repository.
             cgcignore_path: Optional explicit .cgcignore path from the active context.
             ignore_spec: Optional precompiled ignore spec, useful for tests.
+            sync_on_start: Whether to reconcile an existing graph with the current files on disk.
         """
         super().__init__()
         self.graph_builder = graph_builder
@@ -73,8 +75,10 @@ class RepositoryEventHandler(FileSystemEventHandler):
         self.all_file_data = []
         self.imports_map = {}
         
-        # Perform the initial scan and linking when the watcher is created.
-        if perform_initial_scan:
+        # Reconcile an existing graph, or perform the lighter initial relationship scan.
+        if sync_on_start:
+            self.synchronize_with_disk()
+        elif perform_initial_scan:
             self._initial_scan()
 
     def _load_ignore_spec(self, cgcignore_path: str = None) -> None:
@@ -161,6 +165,38 @@ class RepositoryEventHandler(FileSystemEventHandler):
         # Free memory — all_file_data is only needed during the linking pass.
         self.all_file_data.clear()
         info_logger(f"Initial scan and graph linking complete for: {self.repo_path}")
+
+    def synchronize_with_disk(self) -> None:
+        """Reconcile an existing repository graph with the current files on disk."""
+        info_logger(f"Synchronizing watcher graph with disk: {self.repo_path}")
+        current_files = self._iter_supported_files()
+        current_paths = {str(path.resolve()) for path in current_files}
+        indexed_paths = self.graph_builder.get_repo_file_paths(self.repo_path)
+
+        self.imports_map = self.graph_builder.pre_scan_imports(current_files)
+
+        for stale_path in sorted(indexed_paths - current_paths):
+            self.graph_builder.delete_file_from_graph(stale_path)
+
+        refreshed_file_data = []
+        for path in current_files:
+            file_data = self.graph_builder.update_file_in_graph(
+                path,
+                self.repo_path,
+                self.imports_map,
+            )
+            if file_data and "error" not in file_data and not file_data.get("deleted"):
+                refreshed_file_data.append(file_data)
+
+        self.graph_builder.delete_relationship_links(self.repo_path)
+        self.graph_builder.link_function_calls(refreshed_file_data, self.imports_map)
+        self.graph_builder.link_inheritance(refreshed_file_data, self.imports_map)
+        refreshed_file_data.clear()
+
+        info_logger(
+            f"Watcher startup synchronization complete for {self.repo_path}: "
+            f"{len(current_paths)} current files, {len(indexed_paths - current_paths)} removed files"
+        )
 
     def _debounce(self, event_path, action):
         """
@@ -358,7 +394,13 @@ class CodeWatcher:
         self.watches = {} # Store watch objects to allow unscheduling
         self.handlers = {}  # path -> RepositoryEventHandler
 
-    def watch_directory(self, path: str, perform_initial_scan: bool = True, cgcignore_path: str = None):
+    def watch_directory(
+        self,
+        path: str,
+        perform_initial_scan: bool = True,
+        cgcignore_path: str = None,
+        sync_on_start: bool = False,
+    ):
         """Schedules a directory to be watched for changes."""
         path_obj = Path(path).resolve()
         path_str = str(path_obj)
@@ -372,6 +414,7 @@ class CodeWatcher:
             self.graph_builder,
             path_obj,
             perform_initial_scan=perform_initial_scan,
+            sync_on_start=sync_on_start,
             cgcignore_path=cgcignore_path,
         )
         

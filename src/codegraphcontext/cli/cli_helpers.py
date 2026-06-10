@@ -891,10 +891,11 @@ def watch_helper(path: str, context: Optional[str] = None, use_polling: Optional
         
         # Add the directory to watch
         if is_indexed:
-            console.print("[green]✓[/green] Already indexed (no initial scan needed)")
+            console.print("[green]✓[/green] Already indexed. Synchronizing current files...")
             watcher.watch_directory(
                 str(path_obj),
                 perform_initial_scan=False,
+                sync_on_start=True,
                 cgcignore_path=ctx.cgcignore_path,
             )
         else:
