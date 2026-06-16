@@ -105,7 +105,7 @@ target/
 venv_indexing/
 scratch/
 scripts/.agents/
-scripts
+scripts/
 .agents
 *.py[cod]
 .tox/

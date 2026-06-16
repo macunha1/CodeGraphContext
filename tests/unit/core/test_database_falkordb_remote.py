@@ -18,6 +18,7 @@ class TestFalkorDBRemoteManager:
         FalkorDBRemoteManager._instance = None
         FalkorDBRemoteManager._driver = None
         FalkorDBRemoteManager._graph = None
+
         # Remove _initialized from any lingering instance
         if FalkorDBRemoteManager._instance and hasattr(FalkorDBRemoteManager._instance, '_initialized'):
             del FalkorDBRemoteManager._instance._initialized
@@ -33,6 +34,7 @@ class TestFalkorDBRemoteManager:
         env = {
             'FALKORDB_HOST': 'myhost.example.com',
         }
+
         # Clear all FALKORDB_ env vars first
         clean_env = {k: v for k, v in os.environ.items() if not k.startswith('FALKORDB_')}
         clean_env.update(env)
@@ -332,6 +334,7 @@ class TestFactoryFalkorDBRemote:
             'DEFAULT_DATABASE': 'falkordb-remote',
             'FALKORDB_HOST': 'myhost',
         }
+
         # Clear conflicting vars
         clean_env = {k: v for k, v in os.environ.items()
                      if k not in ('DEFAULT_DATABASE', 'CGC_RUNTIME_DB_TYPE')
@@ -381,6 +384,26 @@ class TestFactoryFalkorDBRemote:
             from codegraphcontext.core import get_database_manager
             with pytest.raises(ValueError, match="falkordb-remote"):
                 get_database_manager()
+
+    def test_kuzudb_is_not_a_supported_database_type(self):
+        """Archived KuzuDB remains migration-only, not a runtime backend."""
+        clean_env = {k: v for k, v in os.environ.items()
+                     if k not in ('DEFAULT_DATABASE', 'CGC_RUNTIME_DB_TYPE')}
+        clean_env.update({'DEFAULT_DATABASE': 'kuzudb'})
+
+        with patch.dict(os.environ, clean_env, clear=True):
+            from codegraphcontext.core import get_database_manager
+            with pytest.raises(ValueError) as exc_info:
+                get_database_manager()
+
+        message = str(exc_info.value)
+
+        # KuzuDB data may be migrated, but selecting KuzuDB as the live backend
+        # should keep failing because the upstream dependency is archived.
+        assert "Unknown database type: 'kuzudb'" in message
+        assert "falkordb" in message
+        assert "ladybugdb" in message
+        assert "Use 'kuzudb'" not in message
 
     def test_runtime_db_type_overrides_default_database(self):
         """CGC_RUNTIME_DB_TYPE wins over DEFAULT_DATABASE."""
