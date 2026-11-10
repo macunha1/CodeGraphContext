@@ -1,6 +1,21 @@
 # MCP Tools Reference
 
-This document describes the Model Context Protocol (MCP) tools exposed by CodeGraphContext **0.4.16**. The server registers the full catalog defined in `src/codegraphcontext/tool_definitions.py` (same tools the CLI graph operations rely on). MCP `tools/list` returns **25** tool definitions—the subsections below enumerate each one.
+## Compact agent integration
+
+Startup instructions contain a short navigation contract. Call `get_graph_guide`
+for the graph schema and detailed query workflows when needed. Project prompt
+files are returned through the standard MCP `instructions` field.
+
+Set `CGC_ENABLED_TOOLS` to a comma-separated list of tool names to expose a
+smaller catalog to every client and transport. An unset or empty value exposes
+the normal catalog. Unknown names fail startup. Project `disabledTools` entries
+still take precedence, and excluded tools reject explicit calls.
+
+For example: `CGC_ENABLED_TOOLS=find_code,analyze_code_relationships,get_graph_guide`.
+
+The server catalog is defined in `src/codegraphcontext/tool_definitions.py`.
+MCP `tools/list` returns the enabled subset. The generated reference in
+`docs/docs/reference/mcp.md` describes the catalog's inputs.
 
 ## Tool categories
 

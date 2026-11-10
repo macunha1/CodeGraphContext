@@ -59,7 +59,30 @@ class TestMCPServer:
         response = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
         assert "error" not in response, response.get("error")
         assert response["result"]["instructions"]
-        assert response["result"]["serverInfo"]["systemPrompt"]
+        assert "systemPrompt" not in response["result"]["serverInfo"]
+
+    def test_graph_guidance_is_available_on_demand(self, mock_server):
+        from codegraphcontext.prompts import CODE_GRAPH_GUIDE, LLM_SYSTEM_PROMPT
+
+        result = asyncio.run(mock_server.handle_tool_call("get_graph_guide", {}))
+        assert result == {"guide": CODE_GRAPH_GUIDE}
+        assert "line_number" in result["guide"]
+        assert len(LLM_SYSTEM_PROMPT) < 1000
+        assert len(LLM_SYSTEM_PROMPT) < len(CODE_GRAPH_GUIDE) / 5
+
+    def test_initialize_preserves_project_instructions_once(self, mock_server, monkeypatch, capsys):
+        instructions = "Project-specific guidance\n" + "Use get_graph_guide for the schema."
+        monkeypatch.setattr("codegraphcontext.server.build_system_prompt", lambda: instructions)
+        request = {"jsonrpc": "2.0", "id": 2, "method": "initialize", "params": {}}
+        monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(request) + "\n"))
+
+        async def initialize():
+            await mock_server._run_loop(asyncio.get_running_loop())
+
+        asyncio.run(initialize())
+        response = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+        assert response["result"]["instructions"] == instructions
+        assert instructions not in json.dumps(response["result"]["serverInfo"])
 
     def test_tool_routing(self, mock_server):
         """Test that handle_tool_call routes to the correct internal method."""
@@ -169,7 +192,7 @@ class TestMCPServer:
 
         async def run_test():
             result = await server.handle_tool_call("find_code", {"query": "test"})
-            assert result == {"error": "Tool 'find_code' is disabled in mcp.json (disabledTools)."}
+            assert result == {"error": "Tool 'find_code' is disabled by the server tool configuration."}
 
         asyncio.run(run_test())
 

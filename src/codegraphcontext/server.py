@@ -1,14 +1,9 @@
 # src/codegraphcontext/server.py
-import urllib.parse
 import asyncio
 import json
-import importlib
-import stdlibs
 import sys
 import traceback
 import os
-import re
-from datetime import datetime
 from pathlib import Path
 from dataclasses import asdict
 
@@ -16,19 +11,17 @@ from typing import Any, Dict, Coroutine, Optional, List, Set
 
 from .utils.gcf_encoder import encode_response
 
-from .prompts import LLM_SYSTEM_PROMPT, build_system_prompt
+from .prompts import CODE_GRAPH_GUIDE, build_system_prompt
 from .core import get_database_manager
-from .core.jobs import JobManager, JobStatus
+from .core.jobs import JobManager
 from .core.watcher import CodeWatcher
 from .tools.graph_builder import GraphBuilder
 from .tools.code_finder import CodeFinder
-from .tools.package_resolver import get_local_package_path
-from .utils.debug_log import debug_log, info_logger, error_logger, warning_logger, debug_logger
+from .utils.debug_log import error_logger, warning_logger, debug_logger
 from .cli.config_manager import (
     resolve_context,
     discover_child_contexts,
     save_workspace_mapping,
-    get_workspace_mapping,
     _default_global_db_path,
     CONFIG_DIR,
     load_config,
@@ -250,6 +243,13 @@ class MCPServer:
         Defines the complete tool manifest for the LLM.
         """
         self.disabled_tools = self._load_disabled_tools()
+        enabled_tools = os.environ.get("CGC_ENABLED_TOOLS", "").strip()
+        if enabled_tools:
+            requested = {name.strip() for name in enabled_tools.split(",") if name.strip()}
+            unknown = requested - TOOLS.keys()
+            if not requested or unknown:
+                raise ValueError(f"CGC_ENABLED_TOOLS must name known tools; unknown tools: {sorted(unknown)}")
+            self.disabled_tools.update(TOOLS.keys() - requested)
         self.tools = {
             name: definition
             for name, definition in TOOLS.items()
@@ -710,7 +710,7 @@ class MCPServer:
         Routes a tool call from the AI assistant to the appropriate handler function. 
         """
         if tool_name in self.disabled_tools:
-            return {"error": f"Tool '{tool_name}' is disabled in mcp.json (disabledTools)."}
+            return {"error": f"Tool '{tool_name}' is disabled by the server tool configuration."}
 
         # Normalize path/repo_path aliasing: tool schemas declare `repo_path`
         # while several handlers read `path` (and vice versa). Skip the
@@ -729,6 +729,7 @@ class MCPServer:
                 args["repo_path"] = args["path"]
 
         tool_map: Dict[str, Coroutine] = {
+            "get_graph_guide": lambda: {"guide": CODE_GRAPH_GUIDE},
             "add_package_to_graph": self.add_package_to_graph_tool,
             "find_dead_code": self.find_dead_code_tool,
             "find_code": self.find_code_tool,
@@ -836,11 +837,9 @@ class MCPServer:
                             "serverInfo": {
                                 "name": "CodeGraphContext",
                                 "version": self._get_version(),
-                                "systemPrompt": system_prompt,
-                                "instructionsAvailable": True,
                             },
                             "capabilities": {"tools": {"listTools": True}},
-                            "instructions": LLM_SYSTEM_PROMPT,
+                            "instructions": system_prompt,
                         }
                     }
                 elif method == 'tools/list':

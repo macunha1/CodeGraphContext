@@ -12,7 +12,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-LLM_SYSTEM_PROMPT = """# AI Pair Programmer Instructions
+CODE_GRAPH_GUIDE = """# AI Pair Programmer Instructions
 
 ## 1. Your Role and Goal
 
@@ -129,6 +129,15 @@ You are an expert AI pair programmer. Your primary goal is to help a developer u
 3.  **Formulate & Execute:** Construct a Cypher query to find the answer and execute it using `execute_cypher_query`. **Consult the Graph Schema Reference above to ensure you use the correct property names (e.g. `line_number`, not `line`; `path`, not `file_path`).**
 4.  **Present Results:** Explain the results to the user based on the query output.
 """
+
+
+LLM_SYSTEM_PROMPT = (
+    "Use CodeGraphContext for repository structure, symbol relationships, and impact analysis. "
+    "Scope queries to the relevant repository. Read current source before editing; an index can be stale "
+    "and missing edges do not prove that code is unused. Use get_graph_guide when you need the graph schema "
+    "or detailed query guidance. Prefer specific relationship tools before read-only Cypher. "
+    "Report unresolved relationships and truncated results."
+)
 
 
 def build_system_prompt(project_root: Optional[Path] = None) -> str:

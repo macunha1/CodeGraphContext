@@ -7,6 +7,11 @@ _GRAPH_NAME_PROP = {
 }
 
 TOOLS = {
+    "get_graph_guide": {
+        "name": "get_graph_guide",
+        "description": "Read the graph schema and query workflows when needed for relationship analysis or Cypher.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
     "add_code_to_graph": {
         "name": "add_code_to_graph",
         "description": "Performs a one-time scan of a local folder to add its code to the graph. Ideal for indexing libraries, dependencies, or projects not being actively modified. Returns a job ID for background processing.",
